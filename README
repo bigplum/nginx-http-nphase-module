@@ -1,0 +1,46 @@
+Notes on the nphase module
+---
+
+To install, compile nginx with this ./configure option:
+
+    --add-module=path/to/this/directory
+
+This module is an experiment module for providing a distribute file system by
+nginx. There are two phases processed looply.
+
+Phase 1: send a subrequest to backend to query file position. In case of 200 
+code, the subrequest would write data to client. In case of 302 code, the main 
+request would request backend by Location header line returning, and go into 
+phase 2 process.
+
+Phase 2: send a subrequest to backend to download file, only 200 or 206 
+should be accepted. If downstream sent length equal to request range, the 
+request finished. Otherwise, main request would go to phase 1 and set request 
+range to by already sent length and file size parsed from content-range from 
+backend.
+
+Given that large files stored in many backend servers. The large files are 
+split into many small segments, and the meta information stored in a chunk 
+server(eg. GFS). This module acts as a fronted proxy for downloading files
+by http.
+
+nginx.conf file example:
+
+        location /down {
+            nphase_uri /dummy;
+            nphase_set_uri_var $np_uri;
+            nphase_set_range_var $np_range;
+            set $np_uri http://10.1.1.10;
+            set $np_range "bytes=0-";
+        }
+
+        location /dummy {
+            proxy_pass $np_uri;
+            proxy_set_header Range $np_range;
+        }
+
+
+Changelogs
+  v0.1
+    *   first release
+
