@@ -22,8 +22,11 @@ typedef struct {
 
 typedef struct {
     ngx_uint_t                pr_status;
+    ngx_uint_t                sr_count;
+    ngx_uint_t                sr_count_e;
     ngx_str_t                 uri_var_value;
 
+    off_t                     wfsz;
     ngx_array_t               range_in;
     ngx_http_nphase_range_t   range_sent;
     
@@ -37,7 +40,7 @@ typedef struct {
 } ngx_http_nphase_ctx_t;
 
 typedef struct {
-    ngx_str_t                 bk_addr;
+    ngx_http_nphase_range_t   range_sent;
 } ngx_http_nphase_sub_ctx_t;
 
 typedef struct {
@@ -46,6 +49,7 @@ typedef struct {
     ngx_http_set_variable_pt  set_handler;
 } ngx_http_nphase_variable_t;
 
+#define NGX_HTTP_NPHASE_MAX_RETRY         3
 
 static void * ngx_http_nphase_create_conf(ngx_conf_t *cf);
 static char * ngx_http_nphase_merge_conf(ngx_conf_t *cf, void *parent, void *child);
@@ -65,6 +69,7 @@ ngx_int_t ngx_http_nphase_content_range_parse(u_char *p, ngx_http_nphase_range_t
 ngx_int_t ngx_http_nphase_copy_header_value(ngx_list_t *headers, ngx_str_t *k, ngx_str_t *v);
 ngx_int_t ngx_http_nphase_run_subrequest(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx,
                                                         ngx_str_t *uri, ngx_str_t *args);
+ngx_int_t ngx_http_nphase_process_header(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx);
 
 static ngx_command_t  ngx_http_nphase_commands[] = {
 
@@ -199,7 +204,10 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
     ctx = ngx_http_get_module_ctx(r, ngx_http_nphase_module);
 
     if (ctx != NULL) {
-        if (ctx->sr_error == 1) {
+        if (ctx->sr_count_e >= NGX_HTTP_NPHASE_MAX_RETRY) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "nphase subrequest max retry num(%d) reached",
+                          NGX_HTTP_NPHASE_MAX_RETRY);
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
         
@@ -214,17 +222,16 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
             }
 
             rin = ctx->range_in.elts;
-            if (rin->end == -1) {
-                rin->end = r->headers_out.content_length_n - 1;
-            }
-            ngx_log_debug5(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "nphase range_in s:%O e:%O ffix:%O, range_sent s:%O e:%O", 
-                   rin->start, rin->end, rin->ffix, 
-                   ctx->range_sent.start, ctx->range_sent.end);
             
-            /* todo: compare range_in and range_sent to find out range need send */
+            ngx_log_debug8(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "nphase rin s:%O e:%O f:%O, sent s:%O e:%O, w:%O, c:%d, ce:%d",
+                   rin->start, rin->end, rin->ffix, 
+                   ctx->range_sent.start, ctx->range_sent.end,
+                   ctx->wfsz, ctx->sr_count, ctx->sr_count_e);
+            
+            /* todo: compare ctx->wfsz and range_sent to find out range need send */
 
-            if (ctx->range_sent.end < rin->end + 1) {
+            if (ctx->range_sent.end < ctx->wfsz) {
                 ctx->loc_ready = 0;
                 ctx->body_ready = 0;
 
@@ -240,12 +247,9 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
                 var->len = ngx_sprintf(var->data, "bytes=%O-%O", 
-                                            ctx->range_sent.end, rin->end)
+                                            ctx->range_sent.end, ctx->wfsz)
                                     - var->data;
                 
-                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                "nphase create a new range_var:%V", var);
-
                 /* restore next phase subrequest uri to phase 1 uri */
                 var = ngx_http_get_indexed_variable(r, npcf->uri_var_index);
                 if (var == NULL) {
@@ -424,19 +428,35 @@ ngx_http_nphase_content_handler(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_nphase_subrequest_done(ngx_http_request_t *r, void *data, ngx_int_t rc)
 {
-    ngx_http_nphase_ctx_t   *ctx = data;   /* parent ctx */
+    ngx_http_nphase_ctx_t       *ctx = data;   /* parent ctx */
+    ngx_http_nphase_sub_ctx_t   *sr_ctx;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "nphase subrequest done s:%d", r->headers_out.status);
+
+    
+    sr_ctx = ngx_http_get_module_ctx(r, ngx_http_nphase_module);
+    if (!sr_ctx) {
+        return rc;
+    }
 
     if (r->headers_out.status >= NGX_HTTP_SPECIAL_RESPONSE 
         && r->headers_out.status != NGX_HTTP_MOVED_TEMPORARILY ) 
     {
         ctx->sr_error = 1;
+        ctx->sr_count_e++;
     }
 
-    ctx->sr_done = 1;
+    if ((r->headers_out.status == NGX_HTTP_OK
+        || r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT)
+        &&ctx->range_sent.end == sr_ctx->range_sent.end) 
+    {
+        /* backend return 200 or 206 without body */
+        ctx->sr_error = 1;
+        ctx->sr_count_e++;
+    }
     
+    ctx->sr_done = 1;
     return rc;
 }
 
@@ -477,7 +497,9 @@ ngx_http_nphase_header_filter(ngx_http_request_t *r)
         
         pr_ctx->header_sent = 1;
 
-        r->headers_out.status = pr_ctx->pr_status;
+        if (pr_ctx->pr_status != 0) {
+            r->headers_out.status = pr_ctx->pr_status;
+        }
         
         if (r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT) {
             /* set http code 200 for next range filter */
@@ -514,7 +536,11 @@ ngx_http_nphase_header_filter(ngx_http_request_t *r)
         }
 
         if (r->headers_out.status == NGX_HTTP_MOVED_TEMPORARILY ) {
-        
+            if (ngx_http_nphase_process_header(r, pr_ctx) == NGX_ERROR
+                    && pr_ctx->wfsz == 0) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            
             if (! r->headers_out.location) {
                 u_char              *p;
                 size_t              len = 0;
@@ -676,6 +702,10 @@ ngx_http_nphase_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         {
             pr_ctx->range_sent.end = 
                 r->upstream->pipe->downstream->sent - r->parent->header_size;
+                
+            if (pr_ctx->range_sent.end < 0) {
+                pr_ctx->range_sent.end = 0;
+            }
         }
 
         return ngx_http_output_filter(r->parent, in);        
@@ -1013,5 +1043,48 @@ ngx_http_nphase_run_subrequest(ngx_http_request_t *r,
     }
     ngx_http_set_ctx(sr, sr_ctx, ngx_http_nphase_module);
 
+    ctx->sr_count++;
     return NGX_OK;
 }
+
+ngx_int_t
+ngx_http_nphase_process_header(ngx_http_request_t *r, 
+                                            ngx_http_nphase_ctx_t *ctx)
+{
+    off_t               fsz;
+    u_char              *p;
+    size_t              len;
+    ngx_str_t           val;
+    ngx_str_t           key = ngx_string("X-NP-File-Size");
+    
+    if (ngx_http_nphase_copy_header_value(
+            &r->headers_out.headers, &key, &val) == NGX_OK) 
+    {
+        fsz = 0;
+        len = val.len;
+        p = val.data;
+        for ( ;; ) {
+
+            while (*p == ' ') { 
+                if (fsz != 0) {
+                    return NGX_ERROR;
+                }
+                p++; 
+                len--; 
+            }
+
+            if (*p < '0' || *p > '9') {
+                return NGX_ERROR;
+            }
+            
+            fsz = fsz * 10 + *p++ - '0';
+            len--;
+            if (len == 0) {
+                ctx->wfsz = fsz;
+                break;
+            }
+        }
+    }
+    return NGX_OK;
+}
+

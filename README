@@ -5,7 +5,7 @@ To install, compile nginx with this ./configure option:
 
     --add-module=path/to/this/directory
 
-This module is an experiment module for providing a distribute file system by
+This module is an experimental module for providing a distribute file system by
 nginx. There are two phases processed looply.
 
 Phase 1: send a subrequest to backend to query file position. In case of 200 
@@ -16,7 +16,8 @@ phase 2 process.
 Phase 2: send a subrequest to backend to download file, only 200 or 206 
 should be accepted. If downstream sent length equal to request range, the 
 request finished. Otherwise, main request would go to phase 1 and set request 
-range by sent length and file size parsed from content-range from backend.
+range by sent length and file size parsed from header string(X-NP-File-Size) 
+from phase 1 backend.
 
 Given that large files stored in many backend servers. The large files are 
 split into many small segments, and the meta information stored in a chunk 
