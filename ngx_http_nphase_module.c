@@ -270,6 +270,8 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
 
         /* phase 1 process */
         if (ctx->loc_ready == 1) {
+            ctx->loc_ready = 0;
+            
             /* run subrequest by loc_body_c */
             if (ctx->loc_body_c.len == 0) {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -649,17 +651,24 @@ ngx_http_nphase_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     ngx_http_nphase_sub_ctx_t       *sr_ctx;
     ngx_http_nphase_ctx_t           *pr_ctx;
     
-    if (in == NULL) {
-        return ngx_http_next_body_filter(r, NULL);
-    }
-
-    
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "nphase body filter status:%d", 
                    r->headers_out.status);
     
     if (r == r->main) {
         /* parent request */
+        pr_ctx = ngx_http_get_module_ctx(r, ngx_http_nphase_module);
+
+        if (! pr_ctx) {
+            return ngx_http_next_body_filter(r, in);
+        }
+        
+        if (pr_ctx->sr_error 
+            && r->headers_out.status < NGX_HTTP_SPECIAL_RESPONSE) 
+        {
+            return ngx_http_next_body_filter(r, NULL);
+        }
+        
         return ngx_http_next_body_filter(r, in);
     }else{
         sr_ctx = ngx_http_get_module_ctx(r, ngx_http_nphase_module);
@@ -669,13 +678,13 @@ ngx_http_nphase_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
     
         if (! r->parent) {
-            return ngx_http_next_header_filter(r);
+            return ngx_http_next_body_filter(r, in);
         }
         
         pr_ctx = ngx_http_get_module_ctx(r->parent, ngx_http_nphase_module);
         
         if (! pr_ctx) {
-            return ngx_http_next_header_filter(r);
+            return ngx_http_next_body_filter(r, in);
         }
 
         if (! pr_ctx->body_ready) {
