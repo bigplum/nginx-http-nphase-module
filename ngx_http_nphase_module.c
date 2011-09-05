@@ -9,8 +9,8 @@
 typedef struct {
     off_t        start;
     off_t        end;
-    off_t        ffix;
     off_t        length;
+    ngx_int_t    flag;         /* -1: no range; 0: xxx-xxx ; 1: xxx-;  2: -xxx; */
     ngx_str_t    range;
 } ngx_http_nphase_range_t;
 
@@ -64,12 +64,14 @@ void ngx_http_nphase_discard_bufs(ngx_pool_t *pool, ngx_chain_t *in);
 static char *ngx_http_nphase_uri(ngx_conf_t *cf, ngx_command_t *cmd, void *conf); 
 static char *ngx_http_nphase_set_uri_var(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_nphase_set_range_var(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+ngx_int_t ngx_http_nphase_range_update(ngx_http_request_t *r, ngx_int_t index, off_t start, off_t end, ngx_int_t flag);
 ngx_int_t ngx_http_nphase_range_parse(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx);
 ngx_int_t ngx_http_nphase_content_range_parse(u_char *p, ngx_http_nphase_range_t *range);
 ngx_int_t ngx_http_nphase_copy_header_value(ngx_list_t *headers, ngx_str_t *k, ngx_str_t *v);
 ngx_int_t ngx_http_nphase_run_subrequest(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx,
                                                         ngx_str_t *uri, ngx_str_t *args);
 ngx_int_t ngx_http_nphase_process_header(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx);
+static ngx_int_t ngx_http_nphase_add_range_singlepart_header(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx);
 
 static ngx_command_t  ngx_http_nphase_commands[] = {
 
@@ -189,8 +191,8 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
     ngx_http_nphase_ctx_t             *ctx;
     ngx_http_nphase_conf_t            *npcf;
     ngx_http_variable_value_t         *var;
-    ngx_int_t                     rc;
-    ngx_http_nphase_range_t  *rin;
+    ngx_int_t                       rc;
+    ngx_http_nphase_range_t         *rin;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "nphase access handler");
@@ -224,31 +226,26 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
             rin = ctx->range_in.elts;
             
             ngx_log_debug8(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "nphase rin s:%O e:%O f:%O, sent s:%O e:%O, w:%O, c:%d, ce:%d",
-                   rin->start, rin->end, rin->ffix, 
+                   "nphase rin s:%O e:%O f:%d, sent s:%O e:%O, w:%O, c:%d, ce:%d",
+                   rin->start, rin->end, rin->flag, 
                    ctx->range_sent.start, ctx->range_sent.end,
                    ctx->wfsz, ctx->sr_count, ctx->sr_count_e);
             
             /* todo: compare ctx->wfsz and range_sent to find out range need send */
 
-            if (ctx->range_sent.end < ctx->wfsz) {
+            if ((rin->flag == -1 && ctx->range_sent.end < ctx->wfsz) 
+                || (ctx->range_sent.end < rin->end - rin->start + 1))
+            {
                 ctx->loc_ready = 0;
                 ctx->body_ready = 0;
 
-                /* change range variable */
-                var = ngx_http_get_indexed_variable(r, npcf->range_var_index);
-                if (var == NULL) {
+                if (ngx_http_nphase_range_update(r, npcf->range_var_index, 
+                        rin->start + ctx->range_sent.end, 
+                        rin->end ? rin->end : ctx->wfsz, 0)
+                    != NGX_OK) 
+                {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
-                                
-                var->data = ngx_pnalloc(r->pool, 
-                                sizeof("bytes=-") + 2 * NGX_OFF_T_LEN);
-                if (var->data == NULL) {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-                }
-                var->len = ngx_sprintf(var->data, "bytes=%O-%O", 
-                                            ctx->range_sent.end, ctx->wfsz)
-                                    - var->data;
                 
                 /* restore next phase subrequest uri to phase 1 uri */
                 var = ngx_http_get_indexed_variable(r, npcf->uri_var_index);
@@ -288,6 +285,20 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
             var->len = ctx->loc_body_c.len;
             var->data = ctx->loc_body_c.data;
             
+            rin = ctx->range_in.elts;
+/*
+if (ngx_http_nphase_range_update(r, npcf->range_var_index, 
+                    rin->start, rin->end, rin->flag)
+                != NGX_OK) 
+                */
+            if (ngx_http_nphase_range_update(r, npcf->range_var_index, 
+                    rin->start + ctx->range_sent.end, 
+                    rin->end ? rin->end : ctx->wfsz, 0)
+                != NGX_OK) 
+            {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
             if (ngx_http_nphase_run_subrequest(r, ctx, &npcf->uri, NULL) 
                     != NGX_OK) 
             {
@@ -308,35 +319,15 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    /* get "nphase_set_uri_var" variable  and concat request uri to it 
-    u_char      *p;
-    u_char      *ptmp;
-    size_t      len;
-
-    var = ngx_http_get_indexed_variable(r, npcf->uri_var_index);
-    if (var == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    len = r->uri.len + var->len;
-    p = ngx_palloc(r->pool, len);
-    if (p == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    
-    ptmp = p;
-    p = ngx_copy(p, var->data, var->len);
-    p = ngx_copy(p, r->uri.data, r->uri.len);
-    var->data = ptmp;
-    */ 
-
-    /* parse headers_in range to ctx->range_in*/
+    /* parse headers_in range to ctx->range_in */
     if (r->headers_in.range != NULL) {
         if (r->headers_in.range->value.len >= 7
             && ngx_strncasecmp(r->headers_in.range->value.data,
                            (u_char *) "bytes=", 6)
                == 0) 
         {
-            if (ngx_array_init(&ctx->range_in, r->pool, 1, sizeof(ngx_http_nphase_range_t))
+            if (ngx_array_init(&ctx->range_in, r->pool, 1, 
+                            sizeof(ngx_http_nphase_range_t))
                 != NGX_OK)
             {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -358,7 +349,8 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
             return NGX_HTTP_RANGE_NOT_SATISFIABLE;
         }
     } else {
-        if (ngx_array_init(&ctx->range_in, r->pool, 1, sizeof(ngx_http_nphase_range_t))
+        if (ngx_array_init(&ctx->range_in, r->pool, 1, 
+                        sizeof(ngx_http_nphase_range_t))
             != NGX_OK)
         {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -372,10 +364,18 @@ ngx_http_nphase_access_handler(ngx_http_request_t *r)
         }
 
         range->start = 0;
-        range->end   = -1;
-        range->ffix  = -1;
+        range->end   = 0;
+        range->flag  = -1;
     }
     
+    rin = ctx->range_in.elts;
+    if (ngx_http_nphase_range_update(r, npcf->range_var_index, 
+            rin->start, rin->end, rin->flag)
+        != NGX_OK) 
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
     /* run a subrequest to nphase_uri */
     if (ngx_http_nphase_run_subrequest(r, ctx, &npcf->uri, NULL) 
             != NGX_OK) 
@@ -430,17 +430,34 @@ ngx_http_nphase_content_handler(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_nphase_subrequest_done(ngx_http_request_t *r, void *data, ngx_int_t rc)
 {
+    
+    off_t         size = 0;
+    ngx_chain_t   *ln;
     ngx_http_nphase_ctx_t       *ctx = data;   /* parent ctx */
     ngx_http_nphase_sub_ctx_t   *sr_ctx;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "nphase subrequest done s:%d", r->headers_out.status);
 
-    
     sr_ctx = ngx_http_get_module_ctx(r, ngx_http_nphase_module);
     if (!sr_ctx) {
         return rc;
     }
+
+    /* todo: update ctx->range_sent */
+    for (ln = r->parent->out; ln; ln = ln->next) {
+        size += ngx_buf_size(ln->buf);
+    }
+    
+    ctx->range_sent.end = 
+        r->parent->connection->sent + size - r->parent->header_size;
+        
+    if (ctx->range_sent.end < 0) {
+        ctx->range_sent.end = 0;
+    }
+
+    ngx_log_debug6(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "nphase range sent offset:%O", ctx->range_sent.end);
 
     if (r->headers_out.status >= NGX_HTTP_SPECIAL_RESPONSE 
         && r->headers_out.status != NGX_HTTP_MOVED_TEMPORARILY ) 
@@ -449,9 +466,10 @@ ngx_http_nphase_subrequest_done(ngx_http_request_t *r, void *data, ngx_int_t rc)
         ctx->sr_count_e++;
     }
 
+    // todo: .....
     if ((r->headers_out.status == NGX_HTTP_OK
         || r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT)
-        &&ctx->range_sent.end == sr_ctx->range_sent.end) 
+        && ctx->range_sent.end == 0) 
     {
         /* backend return 200 or 206 without body */
         ctx->sr_error = 1;
@@ -503,10 +521,14 @@ ngx_http_nphase_header_filter(ngx_http_request_t *r)
             r->headers_out.status = pr_ctx->pr_status;
         }
         
+        if (r->headers_out.status == NGX_HTTP_OK) {
+            r->headers_out.content_length_n = pr_ctx->wfsz;
+        }
+        
         if (r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT) {
-            /* set http code 200 for next range filter */
-            r->headers_out.status = NGX_HTTP_OK;
-            r->headers_out.status_line.len = 0;
+            r->headers_out.content_length_n = pr_ctx->wfsz;
+
+            ngx_http_nphase_add_range_singlepart_header(r, pr_ctx);
         }
         
         return ngx_http_next_header_filter(r);
@@ -610,33 +632,7 @@ ngx_http_nphase_header_filter(ngx_http_request_t *r)
             return NGX_OK;
         }
 
-        /* upstream return 20x
-                parse upstream header Content-Range  */
-        ngx_str_t val;
-        ngx_str_t key = ngx_string("Content-Range");
-        
-        if (ngx_http_nphase_copy_header_value(&r->headers_out.headers, &key, &val) == NGX_OK) 
-        {
-            if (val.len >= sizeof("bytes ")
-                && ngx_strncasecmp(val.data, (u_char *) "bytes ", sizeof("bytes ") - 1) == 0)
-            {
-                ngx_http_nphase_range_t range;
-                ngx_int_t               rc;
-
-                rc = ngx_http_nphase_content_range_parse(
-                        (u_char *)(val.data + sizeof("bytes ") - 1), &range);
-                
-                if (rc == NGX_OK) {
-                    /* set  content_length_n to whole file size,
-                                            rather than content length per request
-                                        */
-                    r->parent->headers_out.content_length_n = range.length;
-                } else {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-                }
-            }
-        }
-        
+        /* upstream return 20x */
         pr_ctx->body_ready = 1;
         return NGX_OK;
     }
@@ -701,19 +697,6 @@ ngx_http_nphase_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             
             if (ngx_http_send_header(r->parent) == NGX_ERROR) {
                 return NGX_ERROR;
-            }
-        }
-
-        /* todo: update ctx->range_sent */
-        if (r->upstream 
-            && r->upstream->pipe
-            && r->upstream->pipe->downstream) 
-        {
-            pr_ctx->range_sent.end = 
-                r->upstream->pipe->downstream->sent - r->parent->header_size;
-                
-            if (pr_ctx->range_sent.end < 0) {
-                pr_ctx->range_sent.end = 0;
             }
         }
 
@@ -816,12 +799,48 @@ ngx_http_nphase_set_range_var(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
+ngx_int_t
+ngx_http_nphase_range_update(ngx_http_request_t *r, ngx_int_t index, 
+                                            off_t start, off_t end, ngx_int_t flag)
+{
+    ngx_http_variable_value_t         *var;
+    
+    var = ngx_http_get_indexed_variable(r, index);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+                    
+    var->data = ngx_pnalloc(r->pool, 
+                    sizeof("bytes=-") + 2 * NGX_OFF_T_LEN);
+    if (var->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (flag == 0) {
+        var->len = ngx_sprintf(var->data, "bytes=%O-%O", start, end)
+                        - var->data;
+    } else if (flag == 1) {
+        var->len = ngx_sprintf(var->data, "bytes=%O-", start)
+                        - var->data;
+    } else if (flag == 2) {
+        var->len = ngx_sprintf(var->data, "bytes=-%O", end)
+                        - var->data;
+    } else if (flag == -1) {
+        var->len = ngx_sprintf(var->data, "bytes=0-")
+                        - var->data;
+    } else {
+        return NGX_ERROR;
+    }
+    
+    return NGX_OK;
+}
 
 ngx_int_t
 ngx_http_nphase_range_parse(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx)
 {
     u_char            *p;
-    off_t              start, end, ffix;
+    off_t              start, end;
+    ngx_int_t          flag;
     ngx_uint_t         suffix;
     ngx_http_nphase_range_t  *range;
 
@@ -831,7 +850,7 @@ ngx_http_nphase_range_parse(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx)
         start = 0;
         end = 0;
         suffix = 0;
-        ffix = -1;
+        flag = 0;
 
         while (*p == ' ') { p++; }
 
@@ -859,8 +878,8 @@ ngx_http_nphase_range_parse(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx)
                 }
 
                 range->start = start;
-                range->end = -1;
-                range->ffix = ffix;
+                range->end = end;
+                range->flag = 1;
 
                 if (*p++ != ',') {
                     return NGX_OK;
@@ -889,12 +908,10 @@ ngx_http_nphase_range_parse(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx)
         }
 
         if (suffix) {
-            ffix = end;
-            start = -1;
-            end = -1;
+            flag = 2;
         }
 
-        if (start > end) {
+        if (start > end && flag != 1) {
             return NGX_HTTP_RANGE_NOT_SATISFIABLE;
         }
 
@@ -905,7 +922,7 @@ ngx_http_nphase_range_parse(ngx_http_request_t *r, ngx_http_nphase_ctx_t *ctx)
 
         range->start = start;
         range->end = end;
-        range->ffix = ffix;
+        range->flag = flag;
 
         if (*p++ != ',') {
             return NGX_OK;
@@ -1094,6 +1111,67 @@ ngx_http_nphase_process_header(ngx_http_request_t *r,
             }
         }
     }
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_nphase_add_range_singlepart_header(ngx_http_request_t *r,
+    ngx_http_nphase_ctx_t *ctx)
+{
+    ngx_table_elt_t   *content_range;
+    ngx_http_nphase_range_t         *rin;
+    ngx_http_nphase_range_t         range;
+
+    rin = ctx->range_in.elts;
+    if (rin->flag == -1) {
+        return NGX_OK;
+    }
+
+    content_range = ngx_list_push(&r->headers_out.headers);
+    if (content_range == NULL) {
+        return NGX_ERROR;
+    }
+
+    r->headers_out.content_range = content_range;
+
+    content_range->hash = 1;
+    ngx_str_set(&content_range->key, "Content-Range");
+
+    content_range->value.data = ngx_pnalloc(r->pool,
+                                    sizeof("bytes -/") - 1 + 3 * NGX_OFF_T_LEN);
+    if (content_range->value.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* "Content-Range: bytes SSSS-EEEE/TTTT" header */
+
+    if (rin->flag == 0) {
+        range.start = rin->start;
+        range.end = rin->end;
+    } else if (rin->flag == 1) {
+        range.start = rin->start;
+        range.end = r->headers_out.content_length_n - 1;
+    } else if (rin->flag == 2) {
+        range.start = r->headers_out.content_length_n - rin->end;
+        range.end = r->headers_out.content_length_n - 1;
+    } else {
+        return NGX_ERROR;
+    }
+
+    content_range->value.len = ngx_sprintf(content_range->value.data,
+                                           "bytes %O-%O/%O",
+                                           range.start, range.end,
+                                           r->headers_out.content_length_n)
+                               - content_range->value.data;
+    
+    r->headers_out.content_length_n = range.end - range.start + 1;
+
+    if (r->headers_out.content_length) {
+        r->headers_out.content_length->hash = 0;
+        r->headers_out.content_length = NULL;
+    }
+
     return NGX_OK;
 }
 
